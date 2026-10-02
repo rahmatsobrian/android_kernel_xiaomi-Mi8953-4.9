@@ -1,0 +1,132 @@
+--- a/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_lansi.h
++++ b/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_lansi.h
+@@ -84,6 +84,7 @@
+  * @bus_reg_name: pointer to name of regulator for bus pullup control
+  * @cap_button_map: pointer to 0D button map
+  * @vir_button_map: pointer to virtual button map
++ * @disable_config_update: skip UI config-only reflash on config mismatch
+  */
+ struct synaptics_dsx_board_data {
+ 	bool x_flip;
+@@ -115,6 +116,7 @@
+ 	struct synaptics_dsx_button_map *cap_button_map;
+ 	struct synaptics_dsx_button_map *vir_button_map;
+ 	const char *fw_name;
++	bool disable_config_update;
+ };
+ #endif
+ #endif
+--- a/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_i2c.c
++++ b/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_i2c.c
+@@ -192,6 +192,9 @@
+ 	prop = of_find_property(np, "synaptics,y-flip", NULL);
+ 	bdata->y_flip = prop > 0 ? true : false;
+ 
++	prop = of_find_property(np, "synaptics,disable-config-update", NULL);
++	bdata->disable_config_update = prop > 0 ? true : false;
++
+ 	prop = of_find_property(np, "synaptics,ub-i2c-addr", NULL);
+ 	if (prop && prop->length) {
+ 		retval = of_property_read_u32(np, "synaptics,ub-i2c-addr",
+--- a/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_fw_update.c
++++ b/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_fw_update.c
+@@ -2807,6 +2807,22 @@
+ 		goto exit;
+ 	}
+ 
++	/*
++	 * Aftermarket panels (e.g. KW replacements) carry a config ID that
++	 * legitimately differs from the stock image. Reflashing UI config in
++	 * that case wedges the controller (fwu_wait_for_idle timeout, F01
++	 * query failure) and leaves the touch driver dead. Skip the config
++	 * compare when the DT disables it; genuine firmware updates still go
++	 * through the image_fw_id > device_fw_id path above.
++	 */
++	if (rmi4_data->hw_if->board_data->disable_config_update) {
++		dev_info(rmi4_data->pdev->dev.parent,
++				"%s: UI config update disabled, skipping config compare\n",
++				__func__);
++		flash_area = NONE;
++		goto exit;
++	}
++
+ 	/* Get device config ID */
+ 	retval = fwu_get_device_config_id();
+ 	if (retval < 0) {
+--- a/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_core.c
++++ b/techpack/xiaomi-msm8953/touchscreen/td4310_lansi_e7/synaptics_dsx_core.c
+@@ -3989,6 +3989,8 @@
+ {
+ 	int retval;
+ 	struct synaptics_rmi4_exp_fhandler *exp_fhandler;
++	const struct synaptics_dsx_board_data *bdata =
++			rmi4_data->hw_if->board_data;
+ 
+ 	mutex_lock(&(rmi4_data->rmi4_reset_mutex));
+ 
+@@ -4007,6 +4009,30 @@
+ 	synaptics_rmi4_empty_fn_list(rmi4_data);
+ 
+ 	retval = synaptics_rmi4_query_device(rmi4_data);
++	if (retval < 0 && bdata->reset_gpio >= 0) {
++		/*
++		 * The controller stopped responding to the software reset
++		 * (typical for aftermarket panels right after a power
++		 * cycle). Toggle the hardware reset line and try again
++		 * instead of leaving the driver with an empty function list.
++		 */
++		dev_err(rmi4_data->pdev->dev.parent,
++				"%s: Query failed, issuing hardware reset\n",
++				__func__);
++		gpio_set_value(bdata->reset_gpio, bdata->reset_on_state);
++		msleep(bdata->reset_active_ms);
++		gpio_set_value(bdata->reset_gpio, !bdata->reset_on_state);
++		msleep(bdata->reset_delay_ms);
++		rmi4_data->current_page = MASK_8BIT;
++		if (rmi4_data->hw_if->ui_hw_init) {
++			retval = rmi4_data->hw_if->ui_hw_init(rmi4_data);
++			if (retval < 0)
++				dev_err(rmi4_data->pdev->dev.parent,
++						"%s: ui_hw_init failed after hardware reset\n",
++						__func__);
++		}
++		retval = synaptics_rmi4_query_device(rmi4_data);
++	}
+ 	if (retval < 0) {
+ 		dev_err(rmi4_data->pdev->dev.parent,
+ 				"%s: Failed to query device\n",
+@@ -4823,6 +4849,24 @@
+ 	synaptics_rmi4_sleep_enable(rmi4_data, false);
+ 	synaptics_rmi4_irq_enable(rmi4_data, true, false);
+ 
++	/*
++	 * The controller may have power-cycled while the screen was off
++	 * (attention edge missed while the IRQ was disabled). Poll the
++	 * device status once and reinitialize if it came up unconfigured,
++	 * otherwise touch stays dead until the next edge.
++	 */
++	{
++		int read_retval;
++		struct synaptics_rmi4_f01_device_status status;
++
++		read_retval = synaptics_rmi4_reg_read(rmi4_data,
++				rmi4_data->f01_data_base_addr,
++				status.data, sizeof(status.data));
++		if (read_retval >= 0 && status.unconfigured &&
++				!status.flash_prog)
++			synaptics_rmi4_reinit_device(rmi4_data);
++	}
++
+ #ifdef SYNAPTICS_ESD_CHECK
+ 		printk("SYNAPTICS_ESD_CHECK is on\n");
+ 				queue_delayed_work(rmi4_data->esd_workqueue, &(rmi4_data->esd_work), SYNAPTICS_ESD_CHECK_CIRCLE);
+--- a/arch/arm64/boot/dts/qcom/mi8953/vince/touchscreen.dtsi
++++ b/arch/arm64/boot/dts/qcom/mi8953/vince/touchscreen.dtsi
+@@ -39,6 +39,7 @@
+ 			avdd-supply = <&pm8953_l6>;
+ 			synaptics,pwr-reg-name = "avdd";
+ 			synaptics,bus-reg-name = "vdd";
++			synaptics,disable-config-update;
+ 			pinctrl-names = "pmx_ts_active", "pmx_ts_suspend";
+ 			pinctrl-0 = <&ts_int_active &ts_reset_active>;
+             pinctrl-1 = <&synaptic_int_suspend &synaptic_reset_suspend>;
