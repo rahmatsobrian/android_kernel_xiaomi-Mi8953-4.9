@@ -35,3 +35,17 @@
 	qcom,led-strings-list = [00 01];
 	qcom,ovp-mv = <29500>;
 };
+
+/ {
+	reserved-memory {
+		ramoops_mem: ramoops_region@9fc00000 {
+			compatible = "ramoops";
+			reg = <0x0 0x9fc00000 0x0 0x400000>;
+			console-size = <0x200000>;
+			record-size = <0x20000>;
+			pmsg-size = <0x20000>;
+			ecc-size = <16>;
+			no-map;
+		};
+	};
+};
